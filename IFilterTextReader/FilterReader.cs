@@ -967,9 +967,9 @@ public class FilterReader : TextReader
 
             // For plain text files with encoding detection enabled, use direct reading
             if (_options.UseEncodingDetection &&
-        (extension.Equals(".txt", StringComparison.OrdinalIgnoreCase) ||
-         extension.Equals(".log", StringComparison.OrdinalIgnoreCase) ||
-         extension.Equals(".csv", StringComparison.OrdinalIgnoreCase)))
+                (extension.Equals(".txt", StringComparison.OrdinalIgnoreCase) ||
+                 extension.Equals(".log", StringComparison.OrdinalIgnoreCase) ||
+                 extension.Equals(".csv", StringComparison.OrdinalIgnoreCase)))
             {
                 _useDirectTextReading = true;
 
