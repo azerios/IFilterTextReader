@@ -31,6 +31,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using IFilterTextReader.Exceptions;
+using IFilterTextReader.Helpers;
 
 // ReSharper disable LocalizableElement
 // ReSharper disable FunctionComplexityOverflow
@@ -829,6 +830,7 @@ public class FilterReader : TextReader
             // Ignore
         }
 
+        _textReader?.Dispose();
         _fileStream?.Dispose();
 
         _stopwatch = null;
@@ -910,6 +912,21 @@ public class FilterReader : TextReader
     ///     Collection of metadata properties extracted from file
     /// </summary>
     public readonly Dictionary<string, List<object>> MetaDataProperties = new();
+    // Add these fields to the Fields region (around line 836)
+    /// <summary>
+    ///     When true, use direct text reading instead of IFilter
+    /// </summary>
+    private readonly bool _useDirectTextReading;
+
+    /// <summary>
+    ///     The detected encoding when using direct text reading
+    /// </summary>
+    private Encoding _detectedEncoding;
+
+    /// <summary>
+    ///     StreamReader for direct text reading
+    /// </summary>
+    private StreamReader _textReader;
     #endregion
 
     #region Constructor en Destructor
@@ -926,55 +943,79 @@ public class FilterReader : TextReader
     ///     <see cref="FilterReaderOptions" />
     /// </param>
     public FilterReader(string fileName,
-        string extension = "",
-        FilterReaderOptions filterReaderOptions = null)
+    string extension = "",
+    FilterReaderOptions filterReaderOptions = null)
+{
+    try
     {
-        try
+        if (filterReaderOptions != null)
+            _options = filterReaderOptions;
+
+        _fileName = fileName;
+
+        if (string.IsNullOrWhiteSpace(extension))
         {
-            if (filterReaderOptions != null)
-                _options = filterReaderOptions;
-
-            _fileName = fileName;
-            _fileStream = File.OpenRead(fileName);
-
+            extension = Path.GetExtension(fileName);
             if (string.IsNullOrWhiteSpace(extension))
             {
-                extension = Path.GetExtension(fileName);
-                if (string.IsNullOrWhiteSpace(extension))
-                {
-                    // Try to detect the extension if the file does not have one
-                    var fileInfo = FileTypeSelector.GetFileTypeFileInfo(fileName);
-                    if (fileInfo != null)
-                        extension = fileInfo.Extension;
-                }
+                // Try to detect the extension if the file does not have one
+                var fileInfo = FileTypeSelector.GetFileTypeFileInfo(fileName);
+                if (fileInfo != null)
+                    extension = fileInfo.Extension;
             }
-
-            _filter = FilterLoader.LoadAndInitIFilter(
-                _fileStream,
-                extension,
-                _options.DisableEmbeddedContent,
-                fileName,
-                _options.ReadIntoMemory);
-
-            if (_filter == null)
-            {
-                if (string.IsNullOrWhiteSpace(extension))
-                    throw new IFFilterNotFound(
-                        $"There is no {(Environment.Is64BitProcess ? "64" : "32")} bits IFilter installed for the file '{Path.GetFileName(fileName)}'");
-
-                throw new IFFilterNotFound(
-                    $"There is no {(Environment.Is64BitProcess ? "64" : "32")} bits IFilter installed for the extension '{extension}'");
-            }
-
-            if (_options.ReaderTimeout != FilterReaderTimeout.NoTimeout && _options.Timeout < 0)
-                throw new ArgumentException("Needs to be larger then 0", nameof(_options.Timeout));
         }
-        catch (Exception)
-        {
-            Dispose();
-            throw;
-        }
+
+        // For plain text files with encoding detection enabled, use direct reading
+        if (_options.UseEncodingDetection &&
+    (extension.Equals(".txt", StringComparison.OrdinalIgnoreCase) ||
+     extension.Equals(".log", StringComparison.OrdinalIgnoreCase) ||
+     extension.Equals(".csv", StringComparison.OrdinalIgnoreCase)))
+{
+    _useDirectTextReading = true;
+    
+    // Detect encoding using a separate stream
+    using (var detectionStream = File.OpenRead(fileName))
+    {
+        _detectedEncoding = EncodingDetector.DetectEncoding(detectionStream);
     }
+    
+    // Open a fresh stream for reading with the detected encoding
+    _fileStream = File.OpenRead(fileName);
+    
+    // Use detectEncodingFromByteOrderMarks: false because we already detected the exact encoding
+    // This prevents StreamReader from trying to re-detect and potentially using a different encoding
+    _textReader = new StreamReader(_fileStream, _detectedEncoding, detectEncodingFromByteOrderMarks: false);
+    return;
+}
+
+        _fileStream = File.OpenRead(fileName);
+
+        _filter = FilterLoader.LoadAndInitIFilter(
+            _fileStream,
+            extension,
+            _options.DisableEmbeddedContent,
+            fileName,
+            _options.ReadIntoMemory);
+
+        if (_filter == null)
+        {
+            if (string.IsNullOrWhiteSpace(extension))
+                throw new IFFilterNotFound(
+                    $"There is no {(Environment.Is64BitProcess ? "64" : "32")} bits IFilter installed for the file '{Path.GetFileName(fileName)}'");
+
+            throw new IFFilterNotFound(
+                $"There is no {(Environment.Is64BitProcess ? "64" : "32")} bits IFilter installed for the extension '{extension}'");
+        }
+
+        if (_options.ReaderTimeout != FilterReaderTimeout.NoTimeout && _options.Timeout < 0)
+            throw new ArgumentException("Needs to be larger then 0", nameof(_options.Timeout));
+    }
+    catch (Exception)
+    {
+        Dispose();
+        throw;
+    }
+}
 
     /// <summary>
     ///     Creates an TextReader object for the given <see cref="Stream" />
@@ -1072,25 +1113,63 @@ public class FilterReader : TextReader
     ///     (e.g. files with a wrong extension)
     /// </exception>
     public override int Read(char[] buffer, int index, int count)
+{
+    // Handle direct text reading for encoding-detected files
+    if (_useDirectTextReading)
     {
-        var breakChar = string.Empty;
-
-        if (buffer == null)
-            throw new ArgumentNullException(nameof(buffer));
-
-        if (buffer.Length - index < count)
-            throw new ArgumentException("The buffer is to small");
-
-        if (index < 0)
-            throw new ArgumentOutOfRangeException(nameof(index));
-
-        if (count < 0)
-            throw new ArgumentOutOfRangeException(nameof(count));
-
-        var charsRead = 0;
-
-        if (Timeout())
+        if (_textReader == null || Timeout())
             return 0;
+
+        // Check if we have leftover characters from ReadLine's buffer management
+        if (_charsLeftFromLastRead != null)
+        {
+            var charsToCopy = Math.Min(_charsLeftFromLastRead.Length, count);
+            Array.Copy(_charsLeftFromLastRead, 0, buffer, index, charsToCopy);
+
+            if (charsToCopy < _charsLeftFromLastRead.Length)
+            {
+                // Still have characters left after copying
+                var remaining = new char[_charsLeftFromLastRead.Length - charsToCopy];
+                Array.Copy(_charsLeftFromLastRead, charsToCopy, remaining, 0, remaining.Length);
+                _charsLeftFromLastRead = remaining;
+            }
+            else
+            {
+                // Used all leftover characters
+                _charsLeftFromLastRead = null;
+            }
+
+            return charsToCopy;
+        }
+
+        try
+        {
+            return _textReader.Read(buffer, index, count);
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    var breakChar = string.Empty;
+
+    if (buffer == null)
+        throw new ArgumentNullException(nameof(buffer));
+
+    if (buffer.Length - index < count)
+        throw new ArgumentException("The buffer is to small");
+
+    if (index < 0)
+        throw new ArgumentOutOfRangeException(nameof(index));
+
+    if (count < 0)
+        throw new ArgumentOutOfRangeException(nameof(count));
+
+    var charsRead = 0;
+
+    if (Timeout())
+        return 0;
 
         while (!_done && charsRead < count)
         {
@@ -1317,6 +1396,15 @@ public class FilterReader : TextReader
         }
 
         return charsRead;
+    }
+
+    /// <summary>
+    /// Reads text file with proper encoding detection
+    /// </summary>
+    private static string ReadTextFileWithEncoding(string fileName)
+    {
+        var encoding = EncodingDetector.DetectEncoding(fileName);
+        return File.ReadAllText(fileName, encoding);
     }
     #endregion
 }
