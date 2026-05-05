@@ -185,4 +185,88 @@ public class EncodingDetectorTests
         encoding.Should().BeOfType<UTF8Encoding>();
         stream.Position.Should().Be(5); // Position should be restored
     }
+
+    [Fact]
+    public void DetectEncoding_EmptyFile_ReturnsUtf8WithoutBom()
+    {
+        var file = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".txt");
+        try
+        {
+            File.WriteAllBytes(file, Array.Empty<byte>());
+            var enc = EncodingDetector.DetectEncoding(file);
+    
+            enc.Should().NotBeNull();
+            enc.WebName.Should().Be("utf-8");
+            enc.GetPreamble().Length.Should().Be(0);
+        }
+        finally
+        {
+            if (File.Exists(file)) File.Delete(file);
+        }
+    }
+    
+    [Fact]
+    public void DetectEncoding_PreservesStreamPosition()
+    {
+        var bytes = Encoding.UTF8.GetBytes("prefixテストsuffix");
+        using var ms = new MemoryStream(bytes);
+        ms.Position = 5;
+        var enc = EncodingDetector.DetectEncoding(ms);
+        ms.Position.Should().Be(5);
+        enc.Should().NotBeNull();
+        enc.WebName.Should().Be("utf-8");
+        enc.GetPreamble().Length.Should().Be(0);
+    }
+    
+    [Fact]
+    public void DetectEncoding_ShiftJis_ReturnsCodePage932_WhenAvailable()
+    {
+        Encoding shiftJis;
+        try
+        {
+            shiftJis = Encoding.GetEncoding("shift_jis");
+        }
+        catch
+        {
+            // Skip if Shift-JIS not available on platform - treat as pass
+            return;
+        }
+    
+        var text = "テスト";
+        var file = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".txt");
+        try
+        {
+            File.WriteAllBytes(file, shiftJis.GetBytes(text));
+    
+            var enc = EncodingDetector.DetectEncoding(file);
+    
+            enc.Should().NotBeNull();
+            // Accept either the named encoding or code page 932
+            (enc.CodePage == shiftJis.CodePage || enc.CodePage == 932).Should().BeTrue();
+        }
+        finally
+        {
+            if (File.Exists(file)) File.Delete(file);
+        }
+    }
+    
+    [Fact]
+    public void DetectEncoding_InvalidUtf8_FallsBackToUtf8WithoutBom()
+    {
+        var file = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".bin");
+        try
+        {
+            // invalid/garbled bytes
+            File.WriteAllBytes(file, new byte[] { 0xFF, 0xFE, 0x00, 0x54 });
+            var enc = EncodingDetector.DetectEncoding(file);
+    
+            enc.Should().NotBeNull();
+            enc.WebName.Should().Be("utf-8");
+            enc.GetPreamble().Length.Should().Be(0);
+        }
+        finally
+        {
+            if (File.Exists(file)) File.Delete(file);
+        }
+    }
 }
