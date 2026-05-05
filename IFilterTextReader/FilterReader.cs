@@ -912,7 +912,7 @@ public class FilterReader : TextReader
     ///     Collection of metadata properties extracted from file
     /// </summary>
     public readonly Dictionary<string, List<object>> MetaDataProperties = new();
-    // Add these fields to the Fields region (around line 836)
+    // Add these fields to the Fields region (around line 974)
     /// <summary>
     ///     When true, use direct text reading instead of IFilter
     /// </summary>
