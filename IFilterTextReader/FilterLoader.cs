@@ -24,13 +24,14 @@
 // THE SOFTWARE.
 //
 
+using IFilterTextReader.Exceptions;
+using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
-using IFilterTextReader.Exceptions;
-using Microsoft.Win32;
 
 namespace IFilterTextReader;
 
@@ -59,7 +60,7 @@ internal static class FilterLoader
             // And create an IFilter instance using that class factory
             var filterGuid = typeof(NativeMethods.IFilter).GUID;
             classFactory.CreateInstance(null, ref filterGuid, out var ppunk);
-//              Marshal.ReleaseComObject(classFactory);
+            //              Marshal.ReleaseComObject(classFactory);
             return ppunk as NativeMethods.IFilter;
         }
         catch (Exception exception)
@@ -248,6 +249,70 @@ internal static class FilterLoader
     #endregion
 
     #region LoadAndInitIFilter
+    private static bool HeaderMatchesExtension(Stream stream, string extension, out string headerPreview)
+    {
+        headerPreview = null;
+        if (stream == null) return true;
+
+        try
+        {
+            if (!stream.CanSeek)
+                return true; // can't validate without seeking; let filter try
+
+            var originalPos = stream.Position;
+            stream.Seek(0, SeekOrigin.Begin);
+
+            var probe = new byte[16];
+            var read = stream.Read(probe, 0, probe.Length);
+            // Build preview
+            headerPreview = BitConverter.ToString(probe, 0, Math.Max(0, read));
+            // Common signatures
+            extension = (extension ?? string.Empty).ToLowerInvariant();
+            if (extension == ".pdf")
+            {
+                // "%PDF-" -> 0x25 0x50 0x44 0x46 0x2D
+                if (read >= 5 && probe[0] == 0x25 && probe[1] == 0x50 && probe[2] == 0x44 && probe[3] == 0x46 && probe[4] == 0x2D)
+                {
+                    stream.Seek(originalPos, SeekOrigin.Begin);
+                    return true;
+                }
+
+                stream.Seek(originalPos, SeekOrigin.Begin);
+                return false;
+            }
+
+            if (extension == ".docx" || extension == ".xlsx" || extension == ".pptx" || extension == ".zip")
+            {
+                // PK\x03\x04 or PK\x05\x06 (empty archive) or PK\x07\x08
+                if (read >= 4 && probe[0] == 0x50 && probe[1] == 0x4B)
+                {
+                    stream.Seek(originalPos, SeekOrigin.Begin);
+                    return true;
+                }
+
+                stream.Seek(originalPos, SeekOrigin.Begin);
+                return false;
+            }
+
+            if (extension == ".txt" || extension == ".log" || extension == ".csv")
+            {
+                // allow (text)
+                stream.Seek(originalPos, SeekOrigin.Begin);
+                return true;
+            }
+
+            // Unknown extension: don't block — let the filter try
+            stream.Seek(originalPos, SeekOrigin.Begin);
+            return true;
+        }
+        catch
+        {
+            // If anything goes wrong, be permissive and let filter attempt
+            try { if (stream.CanSeek) stream.Seek(0, SeekOrigin.Begin); } catch { }
+            return true;
+        }
+    }
+
     /// <summary>
     ///     Returns an IFilter for the given <paramref name="stream" />
     ///     when there is no filter available
@@ -264,11 +329,17 @@ internal static class FilterLoader
     /// </param>
     /// <returns><see cref="NativeMethods.IFilter" /> or null when no IFilter DLL is</returns>
     public static NativeMethods.IFilter LoadAndInitIFilter(Stream stream,
-        string extension,
-        bool disableEmbeddedContent,
-        string fileName = "",
-        bool readIntoMemory = false)
+    string extension,
+    bool disableEmbeddedContent,
+    string fileName = "",
+    bool readIntoMemory = false)
     {
+        if (!HeaderMatchesExtension(stream, extension, out var headerPreview))
+        {
+            throw new IFUnknownFormat(
+                $@"The file does not match expected '{extension}' signature. Header bytes: {headerPreview}");
+        }
+
         // Find the dll and ClassID
         GetFilterDllAndClass(extension, out var dllName, out var filterPersistClass);
 
@@ -296,44 +367,160 @@ internal static class FilterLoader
         if (iFilter is NativeMethods.IPersistStream iPersistStream)
         {
             // Create a COM stream
-            IStream comStream;
+            IStream comStream = null;
+            IntPtr nativePtr = IntPtr.Zero;
+            var usedHGlobal = false;
 
             if (readIntoMemory)
             {
                 // Copy the content to global memory
-                var buffer = new byte[stream.Length];
-                // ReSharper disable once MustUseReturnValue
-                stream.Read(buffer, 0, buffer.Length);
-                var nativePtr = Marshal.AllocHGlobal(buffer.Length);
-                Marshal.Copy(buffer, 0, nativePtr, buffer.Length);
-                NativeMethods.CreateStreamOnHGlobal(nativePtr, true, out comStream);
+                using (var ms = new MemoryStream())
+                {
+                    // Ensure start position when possible
+                    if (stream.CanSeek)
+                        stream.Seek(0, SeekOrigin.Begin);
+
+                    stream.CopyTo(ms);
+                    var buffer = ms.ToArray();
+                    nativePtr = Marshal.AllocHGlobal(buffer.Length);
+                    Marshal.Copy(buffer, 0, nativePtr, buffer.Length);
+                    NativeMethods.CreateStreamOnHGlobal(nativePtr, true, out comStream);
+                    usedHGlobal = true;
+                }
             }
             else
             {
+                // Use the stream wrapper. Ensure the stream is at start for filters that expect headers.
+                if (stream.CanSeek)
+                    stream.Seek(0, SeekOrigin.Begin);
+
                 comStream = new IStreamWrapper(stream);
             }
 
             try
             {
+                // Try first time
                 iPersistStream.Load(comStream);
 
                 if (iFilter.Init(iFlags, 0, IntPtr.Zero, out _) == NativeMethods.IFilterReturnCode.S_OK)
                     return iFilter;
             }
-            catch (Exception exception)
+            catch (Exception ex)
             {
-                if (string.IsNullOrWhiteSpace(fileName))
+                // If it's a COM error, log HRESULT and filter details for diagnostics
+                if (ex is COMException comEx)
                 {
-                    Marshal.ReleaseComObject(iFilter);
-                    throw new IFOldFilterFormat(
-                        "An error occurred while trying to load a stream with the IPersistStream interface",
-                        exception);
+                    Trace.TraceError(
+                        $"IPersistStream.Load failed HR=0x{comEx.ErrorCode:X8} for filter dll='{dllName}', class='{filterPersistClass}', ext='{extension}', file='{fileName}'. Exception: {comEx.Message}");
+
+                    // If stream is seekable, log first bytes (useful to detect header mismatch)
+                    try
+                    {
+                        if (stream != null && stream.CanSeek)
+                        {
+                            var pos = stream.Position;
+                            stream.Seek(0, SeekOrigin.Begin);
+                            var header = new byte[64];
+                            var r = stream.Read(header, 0, header.Length);
+                            if (r > 0)
+                                Trace.TraceInformation($"Stream header (first {r} bytes): {BitConverter.ToString(header, 0, r)}");
+                            stream.Seek(pos, SeekOrigin.Begin);
+                        }
+                    }
+                    catch
+                    {
+                        // ignore header logging failures
+                    }
+
+                    // Map common filter HRESULTs to domain exceptions so caller can react accordingly
+                    const int FILTER_E_PASSWORD = unchecked((int)0x8004170B);
+                    const int FILTER_E_TOO_BIG = unchecked((int)0x80041730);
+                    const int FILTER_E_UNKNOWNFORMAT = unchecked((int)0x8004170C);
+
+                    if (comEx.ErrorCode == FILTER_E_PASSWORD)
+                        throw new IFFileIsPasswordProtected($@"The file '{fileName}' or an embedded file is password protected", comEx);
+
+                    if (comEx.ErrorCode == FILTER_E_TOO_BIG)
+                        throw new IFFileToLarge("The file is too large to filter", comEx);
+
+                    if (comEx.ErrorCode == FILTER_E_UNKNOWNFORMAT)
+                        throw new IFUnknownFormat($@"The file '{fileName}' is not in the format the IFilter would expect it to be", comEx);
+
+                    // Otherwise continue to attempt fallback below
+                }
+
+                // If we have a filename we prefer to fall back to IPersistFile path below.
+                if (!string.IsNullOrWhiteSpace(fileName))
+                {
+                    // swallow here to continue to IPersistFile fallback below
+                }
+                else
+                {
+                    // Attempt a robust fallback: copy entire input into an HGLOBAL COM stream and try Load again.
+                    try
+                    {
+                        // Only do fallback if we haven't already used an HGLOBAL stream above.
+                        if (!usedHGlobal)
+                        {
+                            // Try to reset stream position when possible
+                            if (stream.CanSeek)
+                                stream.Seek(0, SeekOrigin.Begin);
+
+                            using (var ms = new MemoryStream())
+                            {
+                                stream.CopyTo(ms);
+                                var buffer = ms.ToArray();
+
+                                // allocate and create HGLOBAL-based COM stream
+                                nativePtr = Marshal.AllocHGlobal(buffer.Length);
+                                try
+                                {
+                                    Marshal.Copy(buffer, 0, nativePtr, buffer.Length);
+                                    NativeMethods.CreateStreamOnHGlobal(nativePtr, true, out var retryComStream);
+                                    // Release previous comStream wrapper if it is a COM object
+                                    if (comStream != null && Marshal.IsComObject(comStream))
+                                    {
+                                        try { Marshal.ReleaseComObject(comStream); } catch { /* ignore */ }
+                                    }
+
+                                    comStream = retryComStream;
+                                    usedHGlobal = true;
+
+                                    // Second attempt
+                                    iPersistStream.Load(comStream);
+
+                                    if (iFilter.Init(iFlags, 0, IntPtr.Zero, out _) == NativeMethods.IFilterReturnCode.S_OK)
+                                        return iFilter;
+                                }
+                                catch
+                                {
+                                    // If CreateStreamOnHGlobal or Load fails, let outer handler throw below.
+                                    // Native memory will be freed by CreateStreamOnHGlobal's fDeleteOnRelease when COM stream released.
+                                    throw;
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception fallbackException)
+                    {
+                        // If fallback failed, release the filter and rethrow as IFOldFilterFormat as before.
+                        if (comStream != null && Marshal.IsComObject(comStream))
+                            Marshal.ReleaseComObject(comStream);
+
+                        Marshal.ReleaseComObject(iFilter);
+                        throw new IFOldFilterFormat(
+                            "An error occurred while trying to load a stream with the IPersistStream interface",
+                            fallbackException);
+                    }
                 }
             }
             finally
             {
                 if (comStream != null && Marshal.IsComObject(comStream))
                     Marshal.ReleaseComObject(comStream);
+                // if nativePtr was allocated and CreateStreamOnHGlobal didn't take ownership, free it.
+                // We only allocated nativePtr and passed fDeleteOnRelease=true to CreateStreamOnHGlobal
+                // so freeing here is unnecessary and unsafe. Leave to COM to free the HGLOBAL when stream released.
             }
         }
 
