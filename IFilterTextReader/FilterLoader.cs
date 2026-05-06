@@ -1,4 +1,3 @@
-//
 // FilterLoader.cs
 //
 // Author: Kees van Spelde <sicos2002@hotmail.com>
@@ -23,18 +22,18 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 //
-
-using IFilterTextReader.Exceptions;
-using Microsoft.Win32;
+ 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
-
+using IFilterTextReader.Exceptions;
+using Microsoft.Win32;
+using System.Diagnostics;
+ 
 namespace IFilterTextReader;
-
+ 
 /// <summary>
 ///     FilterLoader finds the dll and ClassID of the COM object responsible for filtering a specific file extension.
 ///     It then loads that dll, creates the appropriate COM object and returns a pointer to an IFilter instance
@@ -56,7 +55,7 @@ internal static class FilterLoader
             var classFactory = ComHelpers.GetClassFactory(dllName, filterPersistClass);
             if (classFactory == null)
                 return null;
-
+ 
             // And create an IFilter instance using that class factory
             var filterGuid = typeof(NativeMethods.IFilter).GUID;
             classFactory.CreateInstance(null, ref filterGuid, out var ppunk);
@@ -70,7 +69,7 @@ internal static class FilterLoader
         }
     }
     #endregion
-
+ 
     #region GetPersistentHandlerClass
     /// <summary>
     ///     Returns an persistent handler class
@@ -82,19 +81,19 @@ internal static class FilterLoader
     {
         // Try getting the info from the file extension
         var persistentHandlerClass = GetPersistentHandlerClassFromExtension(extension);
-
+ 
         // Try getting the info from the document type 
         if (string.IsNullOrEmpty(persistentHandlerClass))
             persistentHandlerClass = GetPersistentHandlerClassFromDocumentType(extension);
-
+ 
         //Try getting the info from the Content Type
         if (searchContentType && string.IsNullOrEmpty(persistentHandlerClass))
             persistentHandlerClass = GetPersistentHandlerClassFromContentType(extension);
-
+ 
         return persistentHandlerClass;
     }
     #endregion
-
+ 
     #region GetPersistentHandlerClassFromContentType
     /// <summary>
     ///     Returns an persistent handler class based on the content type of the file
@@ -106,16 +105,16 @@ internal static class FilterLoader
         var contentType = ReadFromHKLM($@"Software\Classes\{extension}", "Content Type");
         if (string.IsNullOrEmpty(contentType))
             return null;
-
+ 
         var contentTypeExtension =
             ReadFromHKLM($@"Software\Classes\MIME\Database\Content Type\{contentType}", "Extension");
-
+ 
         return extension.Equals(contentTypeExtension, StringComparison.CurrentCultureIgnoreCase)
             ? null
             : GetPersistentHandlerClass(contentTypeExtension, false);
     }
     #endregion
-
+ 
     #region GetPersistentHandlerClassFromDocumentType
     /// <summary>
     ///     Returns an persistent handler class based on the document type
@@ -128,17 +127,17 @@ internal static class FilterLoader
         var documentType = ReadFromHKLM($@"Software\Classes\{extension}");
         if (string.IsNullOrEmpty(documentType))
             return null;
-
+ 
         // Get the Class ID for this document type
         var docClass = ReadFromHKLM($@"Software\Classes\{documentType}\CLSID");
-
+ 
         // Now get the PersistentHandler for that Class ID
         return string.IsNullOrEmpty(documentType)
             ? null
             : ReadFromHKLM($@"Software\Classes\CLSID\{docClass}\PersistentHandler");
     }
     #endregion
-
+ 
     #region GetPersistentHandlerClassFromExtension
     /// <summary>
     ///     Returns an persistent handler class based on the extension of the file
@@ -150,7 +149,7 @@ internal static class FilterLoader
         return ReadFromHKLM($@"Software\Classes\{extension}\PersistentHandler");
     }
     #endregion
-
+ 
     #region GetFilterDllAndClassFromCache
     /// <summary>
     ///     Checks if the DLL lookup is already in the cache and if so returns the cached entry
@@ -169,13 +168,13 @@ internal static class FilterLoader
             filterPersistClass = cacheEntry.ClassName;
             return true;
         }
-
+ 
         dllName = null;
         filterPersistClass = null;
         return false;
     }
     #endregion
-
+ 
     #region Private class CacheEntry
     /// <summary>
     ///     Used to cache the <see cref="NativeMethods.IFilter">IFilter's</see>
@@ -186,12 +185,12 @@ internal static class FilterLoader
         ///     Returns the name from the filter DLL
         /// </summary>
         public string DllName { get; }
-
+ 
         /// <summary>
         ///     Returns the class name
         /// </summary>
         public string ClassName { get; }
-
+ 
         /// <summary>
         ///     Makes this object and sets it's needed properties
         /// </summary>
@@ -204,19 +203,19 @@ internal static class FilterLoader
         }
     }
     #endregion
-
+ 
     #region Fields
     /// <summary>
     ///     Contains cached IFilter lookups
     /// </summary>
     private static readonly Dictionary<string, CacheEntry> FilterCache = new(StringComparer.OrdinalIgnoreCase);
-
+ 
     /// <summary>
     ///     The <see cref="ComHelpers" /> object
     /// </summary>
     private static readonly ComHelpers ComHelpers = new();
     #endregion
-
+ 
     #region ReadFromHKLM
     /// <summary>
     ///     Read an key from the HKLM and returns it as an string
@@ -228,7 +227,7 @@ internal static class FilterLoader
         // ReSharper disable once IntroduceOptionalParameters.Local
         return ReadFromHKLM(key, null);
     }
-
+ 
     /// <summary>
     ///     Read an key from the HKLM and returns it as an string
     /// </summary>
@@ -240,7 +239,7 @@ internal static class FilterLoader
         var registryKey = Registry.LocalMachine.OpenSubKey(key);
         if (registryKey == null)
             return null;
-
+ 
         using (registryKey)
         {
             return (string)registryKey.GetValue(value);
@@ -248,7 +247,11 @@ internal static class FilterLoader
     }
     #endregion
 
-    #region LoadAndInitIFilter
+    #region Header/Signature check helper
+    /// <summary>
+    /// Lightweight header/signature check to short-circuit obvious extension/format mismatches.
+    /// Returns true when header matches expected signature or when check can't be performed.
+    /// </summary>
     private static bool HeaderMatchesExtension(Stream stream, string extension, out string headerPreview)
     {
         headerPreview = null;
@@ -264,9 +267,11 @@ internal static class FilterLoader
 
             var probe = new byte[16];
             var read = stream.Read(probe, 0, probe.Length);
-            // Build preview
-            headerPreview = BitConverter.ToString(probe, 0, Math.Max(0, read));
-            // Common signatures
+            if (read > 0)
+                headerPreview = BitConverter.ToString(probe, 0, read);
+            else
+                headerPreview = string.Empty;
+
             extension = (extension ?? string.Empty).ToLowerInvariant();
             if (extension == ".pdf")
             {
@@ -283,8 +288,8 @@ internal static class FilterLoader
 
             if (extension == ".docx" || extension == ".xlsx" || extension == ".pptx" || extension == ".zip")
             {
-                // PK\x03\x04 or PK\x05\x06 (empty archive) or PK\x07\x08
-                if (read >= 4 && probe[0] == 0x50 && probe[1] == 0x4B)
+                // PK\x03\x04 or PK\x05\x06 or PK\x07\x08
+                if (read >= 2 && probe[0] == 0x50 && probe[1] == 0x4B)
                 {
                     stream.Seek(originalPos, SeekOrigin.Begin);
                     return true;
@@ -296,7 +301,7 @@ internal static class FilterLoader
 
             if (extension == ".txt" || extension == ".log" || extension == ".csv")
             {
-                // allow (text)
+                // Allow text files
                 stream.Seek(originalPos, SeekOrigin.Begin);
                 return true;
             }
@@ -307,12 +312,14 @@ internal static class FilterLoader
         }
         catch
         {
-            // If anything goes wrong, be permissive and let filter attempt
+            // Be permissive on errors and allow the filter to try
             try { if (stream.CanSeek) stream.Seek(0, SeekOrigin.Begin); } catch { }
             return true;
         }
     }
+    #endregion
 
+    #region LoadAndInitIFilter
     /// <summary>
     ///     Returns an IFilter for the given <paramref name="stream" />
     ///     when there is no filter available
@@ -334,20 +341,23 @@ internal static class FilterLoader
     string fileName = "",
     bool readIntoMemory = false)
     {
+        // Quick header/signature check to avoid calling the filter on obviously mismatched data.
         if (!HeaderMatchesExtension(stream, extension, out var headerPreview))
         {
+            Trace.TraceWarning(
+                $"Header does not match expected signature for extension '{extension}'. Header: {headerPreview}");
             throw new IFUnknownFormat(
                 $@"The file does not match expected '{extension}' signature. Header bytes: {headerPreview}");
         }
 
         // Find the dll and ClassID
         GetFilterDllAndClass(extension, out var dllName, out var filterPersistClass);
-
+ 
         var iFilter = LoadFilterFromDll(dllName, filterPersistClass);
-
+ 
         if (iFilter == null)
             return null;
-
+ 
         var iFlags = NativeMethods.IFILTER_INIT.CANON_HYPHENS |
                      NativeMethods.IFILTER_INIT.CANON_PARAGRAPHS |
                      NativeMethods.IFILTER_INIT.CANON_SPACES |
@@ -357,12 +367,12 @@ internal static class FilterLoader
                      NativeMethods.IFILTER_INIT.HARD_LINE_BREAKS |
                      NativeMethods.IFILTER_INIT.FILTER_OWNED_VALUE_OK |
                      NativeMethods.IFILTER_INIT.EMIT_FORMATTING;
-
+ 
         if (disableEmbeddedContent)
             iFlags |= NativeMethods.IFILTER_INIT.DISABLE_EMBEDDED;
-
+ 
         // ReSharper disable once SuspiciousTypeConversion.Global
-
+ 
         // IPersistStream is assumed on 64 bits systems
         if (iFilter is NativeMethods.IPersistStream iPersistStream)
         {
@@ -370,7 +380,7 @@ internal static class FilterLoader
             IStream comStream = null;
             IntPtr nativePtr = IntPtr.Zero;
             var usedHGlobal = false;
-
+ 
             if (readIntoMemory)
             {
                 // Copy the content to global memory
@@ -379,7 +389,7 @@ internal static class FilterLoader
                     // Ensure start position when possible
                     if (stream.CanSeek)
                         stream.Seek(0, SeekOrigin.Begin);
-
+ 
                     stream.CopyTo(ms);
                     var buffer = ms.ToArray();
                     nativePtr = Marshal.AllocHGlobal(buffer.Length);
@@ -393,15 +403,15 @@ internal static class FilterLoader
                 // Use the stream wrapper. Ensure the stream is at start for filters that expect headers.
                 if (stream.CanSeek)
                     stream.Seek(0, SeekOrigin.Begin);
-
+ 
                 comStream = new IStreamWrapper(stream);
             }
-
+ 
             try
             {
                 // Try first time
                 iPersistStream.Load(comStream);
-
+ 
                 if (iFilter.Init(iFlags, 0, IntPtr.Zero, out _) == NativeMethods.IFilterReturnCode.S_OK)
                     return iFilter;
             }
@@ -432,7 +442,7 @@ internal static class FilterLoader
                         // ignore header logging failures
                     }
 
-                    // Map common filter HRESULTs to domain exceptions so caller can react accordingly
+                    // Map known IFILTER return codes to domain exceptions when available
                     const int FILTER_E_PASSWORD = unchecked((int)0x8004170B);
                     const int FILTER_E_TOO_BIG = unchecked((int)0x80041730);
                     const int FILTER_E_UNKNOWNFORMAT = unchecked((int)0x8004170C);
@@ -445,10 +455,8 @@ internal static class FilterLoader
 
                     if (comEx.ErrorCode == FILTER_E_UNKNOWNFORMAT)
                         throw new IFUnknownFormat($@"The file '{fileName}' is not in the format the IFilter would expect it to be", comEx);
-
-                    // Otherwise continue to attempt fallback below
                 }
-
+ 
                 // If we have a filename we prefer to fall back to IPersistFile path below.
                 if (!string.IsNullOrWhiteSpace(fileName))
                 {
@@ -465,12 +473,12 @@ internal static class FilterLoader
                             // Try to reset stream position when possible
                             if (stream.CanSeek)
                                 stream.Seek(0, SeekOrigin.Begin);
-
+ 
                             using (var ms = new MemoryStream())
                             {
                                 stream.CopyTo(ms);
                                 var buffer = ms.ToArray();
-
+ 
                                 // allocate and create HGLOBAL-based COM stream
                                 nativePtr = Marshal.AllocHGlobal(buffer.Length);
                                 try
@@ -482,13 +490,13 @@ internal static class FilterLoader
                                     {
                                         try { Marshal.ReleaseComObject(comStream); } catch { /* ignore */ }
                                     }
-
+ 
                                     comStream = retryComStream;
                                     usedHGlobal = true;
-
+ 
                                     // Second attempt
                                     iPersistStream.Load(comStream);
-
+ 
                                     if (iFilter.Init(iFlags, 0, IntPtr.Zero, out _) == NativeMethods.IFilterReturnCode.S_OK)
                                         return iFilter;
                                 }
@@ -506,7 +514,7 @@ internal static class FilterLoader
                         // If fallback failed, release the filter and rethrow as IFOldFilterFormat as before.
                         if (comStream != null && Marshal.IsComObject(comStream))
                             Marshal.ReleaseComObject(comStream);
-
+ 
                         Marshal.ReleaseComObject(iFilter);
                         throw new IFOldFilterFormat(
                             "An error occurred while trying to load a stream with the IPersistStream interface",
@@ -523,14 +531,14 @@ internal static class FilterLoader
                 // so freeing here is unnecessary and unsafe. Leave to COM to free the HGLOBAL when stream released.
             }
         }
-
+ 
         if (string.IsNullOrWhiteSpace(fileName))
         {
             Marshal.ReleaseComObject(iFilter);
             throw new IFOldFilterFormat(
                 "The IFilter does not support the IPersistStream interface, supply a filename to use the IFilter");
         }
-
+ 
         // If we get here we probably are using an old IFilter so try to load it the old way
         // ReSharper disable once SuspiciousTypeConversion.Global
         if (iFilter is IPersistFile persistFile)
@@ -544,29 +552,16 @@ internal static class FilterLoader
                 Marshal.ReleaseComObject(iFilter);
                 throw new IFUnknownFormat($"The file '{fileName}' has an unknown format");
             }
-
+ 
             if (iFilter.Init(iFlags, 0, IntPtr.Zero, out _) == NativeMethods.IFilterReturnCode.S_OK)
                 return iFilter;
         }
-
+ 
         Marshal.ReleaseComObject(iFilter);
         return null;
     }
-
-    /// <summary>
-    ///     Clears all cached data and frees loaded filter DLLs.
-    ///     Can only be called when there are no active FilterReader instances exist, e.g. on shutdown.
-    /// </summary>
-    public static void Clear()
-    {
-        lock (FilterCache)
-        {
-            FilterCache.Clear();
-            ComHelpers.Dispose();
-        }
-    }
     #endregion
-
+ 
     #region GetFilterDll
     /// <summary>
     ///     Loads the IFilter for the given <paramref name="extension" />
@@ -585,19 +580,19 @@ internal static class FilterLoader
         lock (FilterCache)
         {
             if (GetFilterDllAndClassFromCache(extension, out dllName, out filterPersistClass)) return;
-
+ 
             var persistentHandlerClass = GetPersistentHandlerClass(extension, true);
-
+ 
             if (persistentHandlerClass != null)
                 if (!GetFilterDllAndClassFromPersistentHandler(persistentHandlerClass, out dllName,
                         out filterPersistClass))
                     throw new IFFilterNotFound(
                         $"Could not find a {(Environment.Is64BitProcess ? "64" : "32")} bits IFilter dll for a file with an '{extension}' extension");
-
+ 
             FilterCache.Add(extension, new CacheEntry(dllName, filterPersistClass));
         }
     }
-
+ 
     /// <summary>
     ///     Returns true when an filter dll has been found based on the persistent handler class
     /// </summary>
@@ -611,18 +606,18 @@ internal static class FilterLoader
         out string filterPersistClass)
     {
         dllName = null;
-
+ 
         // Read the CLASS ID of the IFilter persistent handler
         filterPersistClass =
             ReadFromHKLM(
                 $@"Software\Classes\CLSID\{persistentHandlerClass}\PersistentAddinsRegistered\{{89BCB740-6119-101A-BCB7-00DD010655AF}}");
-
+ 
         if (string.IsNullOrEmpty(filterPersistClass))
             return false;
-
+ 
         // Read the dll name 
         dllName = ReadFromHKLM($@"Software\Classes\CLSID\{filterPersistClass}\InprocServer32");
-
+ 
         return
             !string.IsNullOrEmpty(dllName);
     }
