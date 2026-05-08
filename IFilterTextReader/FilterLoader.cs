@@ -1,4 +1,5 @@
-// FilterLoader.cs
+//
+// ComHelpers.cs
 //
 // Author: Kees van Spelde <sicos2002@hotmail.com>
 //
@@ -22,7 +23,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 //
- 
+
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -246,7 +247,7 @@ internal static class FilterLoader
         }
     }
     #endregion
-
+ 
     #region Header/Signature check helper
     /// <summary>
     /// Lightweight header/signature check to short-circuit obvious extension/format mismatches.
@@ -256,22 +257,22 @@ internal static class FilterLoader
     {
         headerPreview = null;
         if (stream == null) return true;
-
+ 
         try
         {
             if (!stream.CanSeek)
                 return true; // can't validate without seeking; let filter try
-
+ 
             var originalPos = stream.Position;
             stream.Seek(0, SeekOrigin.Begin);
-
+ 
             var probe = new byte[16];
             var read = stream.Read(probe, 0, probe.Length);
             if (read > 0)
                 headerPreview = BitConverter.ToString(probe, 0, read);
             else
                 headerPreview = string.Empty;
-
+ 
             extension = (extension ?? string.Empty).ToLowerInvariant();
             if (extension == ".pdf")
             {
@@ -281,11 +282,11 @@ internal static class FilterLoader
                     stream.Seek(originalPos, SeekOrigin.Begin);
                     return true;
                 }
-
+ 
                 stream.Seek(originalPos, SeekOrigin.Begin);
                 return false;
             }
-
+ 
             if (extension == ".docx" || extension == ".xlsx" || extension == ".pptx" || extension == ".zip")
             {
                 // PK\x03\x04 or PK\x05\x06 or PK\x07\x08
@@ -294,18 +295,18 @@ internal static class FilterLoader
                     stream.Seek(originalPos, SeekOrigin.Begin);
                     return true;
                 }
-
+ 
                 stream.Seek(originalPos, SeekOrigin.Begin);
                 return false;
             }
-
+ 
             if (extension == ".txt" || extension == ".log" || extension == ".csv")
             {
                 // Allow text files
                 stream.Seek(originalPos, SeekOrigin.Begin);
                 return true;
             }
-
+ 
             // Unknown extension: don't block — let the filter try
             stream.Seek(originalPos, SeekOrigin.Begin);
             return true;
@@ -318,7 +319,7 @@ internal static class FilterLoader
         }
     }
     #endregion
-
+ 
     #region LoadAndInitIFilter
     /// <summary>
     ///     Returns an IFilter for the given <paramref name="stream" />
@@ -349,14 +350,25 @@ internal static class FilterLoader
             throw new IFUnknownFormat(
                 $@"The file does not match expected '{extension}' signature. Header bytes: {headerPreview}");
         }
-
+ 
         // Find the dll and ClassID
         GetFilterDllAndClass(extension, out var dllName, out var filterPersistClass);
  
         var iFilter = LoadFilterFromDll(dllName, filterPersistClass);
  
         if (iFilter == null)
+        {
+            Trace.TraceWarning($"Failed to create IFilter instance for dll='{dllName}', class='{filterPersistClass}'. This may indicate a bitness mismatch or an improperly registered IFilter.");
             return null;
+        }
+
+        // If filter doesn't implement IPersistStream but does implement IPersistFile, warn caller.
+        if (!(iFilter is NativeMethods.IPersistStream) && (iFilter is IPersistFile))
+        {
+            Trace.TraceWarning(
+                $"IFilter from dll='{dllName}', class='{filterPersistClass}' appears to be an older IFilter that implements IPersistFile but not IPersistStream. " +
+                "Passing a stream without a filename may fail. Provide a filename or set ReadIntoMemory=true.");
+        }
  
         var iFlags = NativeMethods.IFILTER_INIT.CANON_HYPHENS |
                      NativeMethods.IFILTER_INIT.CANON_PARAGRAPHS |
@@ -371,9 +383,8 @@ internal static class FilterLoader
         if (disableEmbeddedContent)
             iFlags |= NativeMethods.IFILTER_INIT.DISABLE_EMBEDDED;
  
-        // ReSharper disable once SuspiciousTypeConversion.Global
- 
         // IPersistStream is assumed on 64 bits systems
+        // ReSharper disable once SuspiciousTypeConversion.Global
         if (iFilter is NativeMethods.IPersistStream iPersistStream)
         {
             // Create a COM stream
@@ -422,7 +433,7 @@ internal static class FilterLoader
                 {
                     Trace.TraceError(
                         $"IPersistStream.Load failed HR=0x{comEx.ErrorCode:X8} for filter dll='{dllName}', class='{filterPersistClass}', ext='{extension}', file='{fileName}'. Exception: {comEx.Message}");
-
+ 
                     // If stream is seekable, log first bytes (useful to detect header mismatch)
                     try
                     {
@@ -441,20 +452,26 @@ internal static class FilterLoader
                     {
                         // ignore header logging failures
                     }
-
+ 
                     // Map known IFILTER return codes to domain exceptions when available
                     const int FILTER_E_PASSWORD = unchecked((int)0x8004170B);
                     const int FILTER_E_TOO_BIG = unchecked((int)0x80041730);
                     const int FILTER_E_UNKNOWNFORMAT = unchecked((int)0x8004170C);
-
+                    const int FILTER_E_OLD_FORMAT = unchecked((int)0x80CB4008);
+ 
                     if (comEx.ErrorCode == FILTER_E_PASSWORD)
                         throw new IFFileIsPasswordProtected($@"The file '{fileName}' or an embedded file is password protected", comEx);
-
+ 
                     if (comEx.ErrorCode == FILTER_E_TOO_BIG)
                         throw new IFFileToLarge("The file is too large to filter", comEx);
-
+ 
                     if (comEx.ErrorCode == FILTER_E_UNKNOWNFORMAT)
                         throw new IFUnknownFormat($@"The file '{fileName}' is not in the format the IFilter would expect it to be", comEx);
+
+                    if (comEx.ErrorCode == FILTER_E_OLD_FORMAT)
+                        throw new IFOldFilterFormat(
+                            $"The IFilter for extension '{extension}' does not support stream loading (HR=0x80CB4008). Supply a file path or use ReadIntoMemory=true.",
+                            comEx);
                 }
  
                 // If we have a filename we prefer to fall back to IPersistFile path below.
@@ -511,7 +528,50 @@ internal static class FilterLoader
                     }
                     catch (Exception fallbackException)
                     {
-                        // If fallback failed, release the filter and rethrow as IFOldFilterFormat as before.
+                        // If fallback failed, attempt a temp-file fallback when possible.
+                        string tempFilePath = null;
+                        try
+                        {
+                            if (stream != null && stream.CanSeek)
+                            {
+                                // create temp file with extension to help older filters detect format
+                                tempFilePath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString() +
+                                                          (string.IsNullOrEmpty(extension) ? string.Empty : extension));
+                                // Reset stream if possible
+                                if (stream.CanSeek)
+                                    stream.Seek(0, SeekOrigin.Begin);
+                                using (var outFs = File.Create(tempFilePath))
+                                {
+                                    stream.CopyTo(outFs);
+                                    outFs.Flush();
+                                }
+ 
+                                // Try IPersistFile if supported
+                                if (iFilter is IPersistFile persistFileSupported)
+                                {
+                                    try
+                                    {
+                                        persistFileSupported.Load(tempFilePath, 0);
+                                        if (iFilter.Init(iFlags, 0, IntPtr.Zero, out _) == NativeMethods.IFilterReturnCode.S_OK)
+                                            return iFilter;
+                                    }
+                                    catch
+                                    {
+                                        // swallow and continue to rethrow below
+                                    }
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            // cleanup temp file
+                            if (!string.IsNullOrEmpty(tempFilePath))
+                            {
+                                try { File.Delete(tempFilePath); } catch { }
+                            }
+                        }
+ 
+                        // Release COM objects and surface original fallback exception
                         if (comStream != null && Marshal.IsComObject(comStream))
                             Marshal.ReleaseComObject(comStream);
  
